@@ -17,16 +17,18 @@ const (
 	PPCAP_DATA_EXTENSION             = ".ppcapd"
 	PPCAP_INDEX_EXTENSION            = ".ppcapi"
 	PPCAP_MAGIC                      = 0x594c4f50 // 'POLY' (looks like text)
-	PPCAP_VERSION                    = 1
+	PPCAP_VERSION                    = 2
 	PPCAP_DEFAULT_MAX_BLOCK_MESSAGES = 256
 	PPCAP_DEFAULT_MAX_BLOCK_SIZE     = 4096
 	PPCAP_DEFAULT_FLUSH_INTERVAL_SEC = 60
 	PPCAP_MAX_PACKET_SIZE            = 65535
 	sizeofIndexFileHeader            = 256
 	sizeofIndexEntry                 = 32
-	sizeofPacketHeader               = 2 // just the length (16 bits)
 	fileSizeOffsetInHeader           = 16
 	bufferSize                       = 1024 * 1024 // ideal write size
+
+	// index file flags go below
+	HDRLAY_HAVE_STREAM_INDEX = 1
 )
 
 ///////// INTERNAL UTILITY FUNCTIONS
@@ -57,11 +59,33 @@ func littleEndian_Uint48(b []byte) uint64 {
 
 ///////// BASIC DATSTRUCTURES
 
+type PacketHeaderLayout struct {
+	Flags             uint32 // from IndexFileHeader
+	Size              int    // from IndexFileHeader
+	StreamIndexOffset int    // computed from flags
+}
+
+func BuildPacketHeaderLayout(hdrlay *PacketHeaderLayout, Flags uint32) {
+	hdrlay.Flags = Flags
+	size := 2 // length
+	if hdrlay.Flags&HDRLAY_HAVE_STREAM_INDEX > 0 {
+		hdrlay.StreamIndexOffset = size
+		size += 2
+	}
+	hdrlay.Size = size
+}
+
 type IndexFileHeader struct {
 	Magic                uint32
 	Version              uint32
 	CreationTimeUnix64   int64
 	TimesOpenedForAppend uint32
+
+	// added in version 2 to allow storing auxiliary per-packet data, e.g.
+	// stream index if multiple streams are written in a single file.
+	Flags            uint32
+	PacketHeaderSize byte
+
 	// reserved space
 	HumanReadableDescription string // 128:255
 }
@@ -74,6 +98,12 @@ func (hdr *IndexFileHeader) Parse(buf []byte) bool {
 	hdr.Version = binary.LittleEndian.Uint32(buf[4:8])
 	hdr.CreationTimeUnix64 = int64(binary.LittleEndian.Uint64(buf[8:16]))
 	hdr.TimesOpenedForAppend = binary.LittleEndian.Uint32(buf[16:20])
+	hdr.Flags = binary.LittleEndian.Uint32(buf[20:24]) // added in version 2
+	hdr.PacketHeaderSize = buf[25]                     // added in version 2
+	if hdr.Version < 2 || hdr.PacketHeaderSize == 0 {
+		hdr.PacketHeaderSize = 2
+	}
+
 	hdr.HumanReadableDescription = strings.TrimRight(string(buf[128:255]), "\x00")
 
 	if hdr.Magic != PPCAP_MAGIC {
@@ -88,20 +118,19 @@ type BlockInfo struct {
 	/*
 		disk representation:
 			hash:8
-			position: 6
-			seq_num: 6
-			length: 4
+			position:6
+			seq_num:6
+			length:4
 			time:8
+
+		total = 32 bytes
 	*/
 
-	hash      uint64
-	position  int64 // store as 6 byte
-	seqNum    int64 // store as 6 byte
-	byteCount int
-	time      int64 // (unix time in nanoseconds) of the first message in this block
-
-	// not written on disk
-	messageCount int
+	Hash      uint64
+	Position  int64 // store as 6 byte
+	SeqNum    int64 // store as 6 byte
+	ByteCount int
+	Time      int64 // (unix time in nanoseconds) of the first message in this block
 }
 
 func (b *BlockInfo) Parse(buf []byte) bool {
@@ -109,22 +138,22 @@ func (b *BlockInfo) Parse(buf []byte) bool {
 		return false
 	}
 
-	b.hash = binary.LittleEndian.Uint64(buf[0:8])
-	b.position = int64(littleEndian_Uint48(buf[8:14]))
-	b.seqNum = int64(littleEndian_Uint48(buf[14:20]))
-	b.byteCount = int(binary.LittleEndian.Uint32(buf[20:24]))
-	b.time = int64(binary.LittleEndian.Uint32(buf[24:32]))
+	b.Hash = binary.LittleEndian.Uint64(buf[0:8])
+	b.Position = int64(littleEndian_Uint48(buf[8:14]))
+	b.SeqNum = int64(littleEndian_Uint48(buf[14:20]))
+	b.ByteCount = int(binary.LittleEndian.Uint32(buf[20:24]))
+	b.Time = int64(binary.LittleEndian.Uint32(buf[24:32]))
 
 	return true
 }
 
 // no error checking because this block is known-good (i.e. already passed hashing)
-func CountMessagesInKnownGoodBlock(block []byte) int {
+func CountMessagesInKnownGoodBlock(block []byte, packetHeaderSize int) int {
 	count := 0
 	for {
 		count += 1
-		psize := binary.LittleEndian.Uint16(block[0:2])
-		block = block[2+psize:]
+		psize := int(binary.LittleEndian.Uint16(block[0:2]))
+		block = block[packetHeaderSize+psize:]
 		if len(block) <= 0 {
 			break
 		}
@@ -153,6 +182,8 @@ func WriteIndexFileHeader(indexFd *os.File, header *IndexFileHeader) error {
 	binary.LittleEndian.PutUint32(buf[4:8], header.Version)
 	binary.LittleEndian.PutUint64(buf[8:16], uint64(header.CreationTimeUnix64))
 	binary.LittleEndian.PutUint32(buf[16:20], header.TimesOpenedForAppend)
+	binary.LittleEndian.PutUint32(buf[20:24], header.Flags)
+	buf[25] = header.PacketHeaderSize
 
 	copy(buf[128:255], []byte(header.HumanReadableDescription))
 
@@ -163,6 +194,61 @@ func WriteIndexFileHeader(indexFd *os.File, header *IndexFileHeader) error {
 	return nil
 }
 
+type CapturePath struct {
+	BasePath         string // this is used if nonempty, otherwise the individual index/data paths are used
+	DataPath         string
+	IndexPath        string
+	ManualExtensions bool // if set, .ppcapd and .ppcapi are not automatically added
+}
+
+func (where *CapturePath) BuildPaths() (string, string) {
+	var indexPath string
+	var dataPath string
+	if len(where.BasePath) > 0 {
+		indexPath = where.BasePath
+		dataPath = where.BasePath
+	} else {
+		indexPath = where.IndexPath
+		dataPath = where.DataPath
+	}
+	if !where.ManualExtensions {
+		indexPath += PPCAP_INDEX_EXTENSION
+		dataPath += PPCAP_DATA_EXTENSION
+	}
+	if indexPath == dataPath {
+		panic("that's not going to work")
+	}
+	return indexPath, dataPath
+}
+
+func OpenCapture(where *CapturePath, flag int, perm os.FileMode) (indexFd *os.File, dataFd *os.File, err error) {
+	indexPath, dataPath := where.BuildPaths()
+	indexFd, indexErr := os.OpenFile(indexPath, flag, perm)
+	dataFd, dataErr := os.OpenFile(dataPath, flag, perm)
+
+	if indexErr == nil && dataErr == nil {
+		// ok, both files opened successfully
+	} else if os.IsNotExist(indexErr) && os.IsNotExist(dataErr) {
+		// ok, neither file exists yet
+		return nil, nil, nil
+	} else {
+		// something went wrong
+		if os.IsNotExist(indexErr) || indexErr == nil {
+			err = dataErr
+		}
+		err = indexErr
+	}
+
+	if err != nil {
+		indexFd.Close()
+		dataFd.Close()
+		dataFd = nil
+		indexFd = nil
+	}
+
+	return
+}
+
 // ReopenAndTruncateExistingCapture opens a capture and truncates any invalid
 //   blocks between the end and the last valid block. The purpose of this
 //   is to re-synchronize the .*d and .*i files following an unclean shutdown.
@@ -171,8 +257,8 @@ func WriteIndexFileHeader(indexFd *os.File, header *IndexFileHeader) error {
 // Note that this function is *NOT* meant to be an extensive integrity check,
 //   and data _before_ the last valid block is not scanned for errors.
 func ReopenAndTruncateExistingCapture(
-	indexPath string,
-	dataPath string,
+	where *CapturePath,
+	hdrlay *PacketHeaderLayout,
 	outbValidExistingFile *bool,
 	outHeader *IndexFileHeader,
 	outMessageSequence *int64) error {
@@ -182,23 +268,16 @@ func ReopenAndTruncateExistingCapture(
 	*outHeader = IndexFileHeader{}
 	*outMessageSequence = 0
 
-	// open both files (and make sure they get closed)
-	indexFd, indexErr := os.OpenFile(indexPath, os.O_RDWR, 0644)
-	defer indexFd.Close()
-	dataFd, dataErr := os.OpenFile(dataPath, os.O_RDWR, 0644)
-	defer dataFd.Close()
-
-	if indexErr == nil && dataErr == nil {
-		// ok, both files opened successfully
-	} else if os.IsNotExist(indexErr) && os.IsNotExist(dataErr) {
+	indexFd, dataFd, err := OpenCapture(where, os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	if indexFd == nil && dataFd == nil {
 		// ok, neither file exists yet
 		return nil
-	} else {
-		// something went wrong
-		if os.IsNotExist(indexErr) || indexErr == nil {
-			return dataErr
-		}
-		return indexErr
+	}
+	if indexFd == nil || dataFd == nil {
+		panic("shouldn't happen")
 	}
 
 	// below, both files are open
@@ -236,27 +315,27 @@ func ReopenAndTruncateExistingCapture(
 	var hasher xxhash.XXHash64
 	var blockHdr BlockInfo
 	hdrBuf := make([]byte, sizeofIndexEntry)
-	dataBuf := make([]byte, PPCAP_DEFAULT_MAX_BLOCK_SIZE)
+	dataBuf := make([]byte, 2*PPCAP_DEFAULT_MAX_BLOCK_SIZE)
 	for blockIdx := numBlocks - 1; blockIdx >= 0; blockIdx-- {
 		indexEntryOffset := sizeofIndexFileHeader + blockIdx*sizeofIndexEntry
 		if _, err := indexFd.ReadAt(hdrBuf, indexEntryOffset); err != nil {
 			return err
 		}
 		blockHdr.Parse(hdrBuf) // always succeeds
-		if blockHdr.byteCount > cap(dataBuf) {
-			dataBuf = make([]byte, blockHdr.byteCount)
+		if blockHdr.ByteCount > cap(dataBuf) {
+			dataBuf = make([]byte, 2*blockHdr.ByteCount)
 		}
-		blockEnd := blockHdr.position + int64(blockHdr.byteCount)
+		blockEnd := blockHdr.Position + int64(blockHdr.ByteCount)
 		if blockEnd < dataFileSize {
-			blockBuf := dataBuf[:blockHdr.byteCount]
-			if _, err := dataFd.ReadAt(blockBuf, blockHdr.position); err != nil {
+			blockBuf := dataBuf[:blockHdr.ByteCount]
+			if _, err := dataFd.ReadAt(blockBuf, blockHdr.Position); err != nil {
 				return err
 			}
 			hasher.Reset()
 			hasher.Write(blockBuf)
-			if hasher.Sum64() == blockHdr.hash {
-				messageCount := CountMessagesInKnownGoodBlock(blockBuf)
-				*outMessageSequence = blockHdr.seqNum + int64(messageCount)
+			if hasher.Sum64() == blockHdr.Hash {
+				messageCount := CountMessagesInKnownGoodBlock(blockBuf, hdrlay.Size)
+				*outMessageSequence = blockHdr.SeqNum + int64(messageCount)
 				// matched successfully
 				lastGoodIndexPosition = indexEntryOffset + sizeofIndexEntry
 				lastGoodDataPosition = blockEnd
