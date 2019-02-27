@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="misc/illustration.png" />
+</p>
+
 # PPCAP
 Polygon.io Packet CAPture format
 
