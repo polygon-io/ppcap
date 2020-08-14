@@ -31,20 +31,16 @@ type Writer struct {
 	maxMessagesPerBlock  int
 	maxBytesPerBlock     int
 	maxFlushIntervalNs   int64
+	protocolHeaders      []byte
 }
 
-func NewWriter(humanReadableDescription string, recordStreamIndex bool) *Writer {
+func NewWriter(humanReadableDescription string, layout PacketHeaderLayout) *Writer {
 	w := &Writer{}
 	w.maxMessagesPerBlock = PPCAP_DEFAULT_MAX_BLOCK_MESSAGES
 	w.maxBytesPerBlock = PPCAP_DEFAULT_MAX_BLOCK_SIZE
 	w.maxFlushIntervalNs = 1000000000 * PPCAP_DEFAULT_FLUSH_INTERVAL_SEC
 	w.HumanReadableDescription = humanReadableDescription
-	// Set up the packet header layout based on the flags
-	flags := uint32(0)
-	if recordStreamIndex {
-		flags |= HDRLAY_HAVE_STREAM_INDEX
-	}
-	BuildPacketHeaderLayout(&w.hdrlay, flags)
+	w.hdrlay = layout
 	w.lastFlushTime = time.Now().UnixNano()
 	return w
 }
@@ -97,11 +93,6 @@ func (w *Writer) Open(basePath string) error {
 		// w.messageSequence = 0 // is already zero via default init
 	}
 
-	w.header.Magic = PPCAP_MAGIC
-	w.header.Version = PPCAP_VERSION
-	w.header.HumanReadableDescription = w.HumanReadableDescription
-	w.header.PacketHeaderSize = byte(w.hdrlay.Size)
-
 	// open files (create,writeonly), update header on disk
 
 	w.indexFd, w.dataFd, err = OpenCapture(where, os.O_WRONLY|os.O_CREATE, 0644)
@@ -112,11 +103,25 @@ func (w *Writer) Open(basePath string) error {
 		panic("shouldn't happen")
 	}
 
+	w.header.Magic = PPCAP_MAGIC
+	w.header.Version = PPCAP_VERSION
+	w.header.HumanReadableDescription = w.HumanReadableDescription
+	w.header.PacketHeaderSize = byte(w.hdrlay.Size)
+	w.header.Flags = w.hdrlay.Flags
+	w.header.ProtocolHeadersSize = uint16(w.hdrlay.ProtocolHeadersSize)
+	w.header.DataHeaderSize = uint32(w.hdrlay.DataHeaderSize)
+
+	if err = WriteDataFileHeader(w.dataFd, &w.header); err != nil {
+		return err
+	}
+
 	if err = WriteIndexFileHeader(w.indexFd, &w.header); err != nil {
 		return err
 	}
 
 	// create write buffers
+
+	w.protocolHeaders = make([]byte, w.header.ProtocolHeadersSize)
 
 	w.indexWriter, err = NewBufferedWriter(w.indexFd, bufferSize)
 	if err != nil {
@@ -156,7 +161,83 @@ func (w *Writer) Close() error {
 	return nil
 }
 
+func ipChecksum(b []byte) uint16 {
+	sum := uint32(0)
+	for i := 0; i < len(b); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(b[i : i+2]))
+	}
+	for (sum >> 16) > 0 {
+		sum = (sum >> 16) + (sum & 0xffff)
+	}
+	return uint16(^sum)
+}
+
+func (w *Writer) AppendFakeIPV4UDP(payload []byte, packetReadTime int64,
+	ipSourceAddr uint32, ipDestAddr uint32,
+	udpSourcePort uint16, udpDestPort uint16) error {
+	headers := w.protocolHeaders[0:28]
+
+	/*
+		uint8_t  ip_v_hl;       // version & header length
+		uint8_t  ip_tos;        // type of service
+		uint16_t ip_len;        // total length
+		uint16_t ip_id;	        // identification
+		uint16_t ip_off;        // fragment offset field
+		uint8_t  ip_ttl;        // time to live
+		uint8_t  ip_p;	        // protocol
+		uint16_t ip_sum;        // checksum
+		uint32_t ip_src,ip_dst; // source and dest address
+	*/
+	ipv4 := headers[0:20]
+
+	/*
+		uint16_t src_port;
+		uint16_t dst_port;
+		uint16_t len;
+		uint16_t checksum;
+	*/
+	udp := headers[20:28]
+
+	// version(4), length(20)
+	ipv4[0] = byte(0x45)
+	// TOS
+	ipv4[1] = 0
+	// total length
+	binary.BigEndian.PutUint16(ipv4[2:4], uint16(28+len(payload)))
+	// identification
+	binary.BigEndian.PutUint16(ipv4[4:6], 0)
+	// fragment offset (don't fragment)
+	binary.BigEndian.PutUint16(ipv4[6:8], 0x4000)
+	// TTL
+	ipv4[8] = 255
+	// protocol (17=UDP)
+	ipv4[9] = 17
+	// Checksum
+	binary.BigEndian.PutUint16(ipv4[10:12], 0)
+	// source IP
+	binary.BigEndian.PutUint32(ipv4[12:16], ipSourceAddr)
+	// dest IP
+	binary.BigEndian.PutUint32(ipv4[16:20], ipDestAddr)
+	// update checksum
+	binary.BigEndian.PutUint16(ipv4[10:12], ipChecksum(ipv4))
+
+	if PPCAP_DEBUG && (ipChecksum(ipv4) != 0) {
+		panic("fail")
+	}
+
+	binary.BigEndian.PutUint16(udp[0:2], udpSourcePort)
+	binary.BigEndian.PutUint16(udp[2:4], udpDestPort)
+	binary.BigEndian.PutUint16(udp[4:6], uint16(8+len(payload)))
+	binary.BigEndian.PutUint16(udp[6:8], 0)
+
+	return w.appendPacket(headers, payload, packetReadTime, 0)
+}
+
 func (w *Writer) AppendPacket(packet []byte, packetReadTime int64, packetStreamIndex uint16) error {
+	return w.appendPacket(nil, packet, packetReadTime, packetStreamIndex)
+}
+
+func (w *Writer) appendPacket(headers []byte, packet []byte, packetReadTime int64, packetStreamIndex uint16) error {
 	if len(packet) > PPCAP_MAX_PACKET_SIZE {
 		return errors.New("ppcap.Writer.AppendPacket: input exceeds PPCAP_MAX_PACKET_SIZE")
 	}
@@ -165,7 +246,12 @@ func (w *Writer) AppendPacket(packet []byte, packetReadTime int64, packetStreamI
 		fmt.Printf("Append packet: size = %v bytes\n", len(packet))
 	}*/
 
-	packetLen := len(packet)
+	if len(headers) != w.hdrlay.ProtocolHeadersSize {
+		// the writer needs to be set up with the correct layout to use this function
+		panic("invalid usage")
+	}
+
+	packetLen := len(headers) + len(packet)
 	bytesToAppend := packetLen + w.hdrlay.Size
 
 	needDataFlush := (bytesToAppend > w.dataWriter.bufferAvail) ||
@@ -196,12 +282,21 @@ func (w *Writer) AppendPacket(packet []byte, packetReadTime int64, packetStreamI
 	if err != nil {
 		return err
 	}
-	binary.LittleEndian.PutUint16(buf[0:2], uint16(packetLen))
-	if w.hdrlay.Flags&HDRLAY_HAVE_STREAM_INDEX > 0 {
-		offset := w.hdrlay.StreamIndexOffset
-		binary.LittleEndian.PutUint16(buf[offset:2+offset], packetStreamIndex)
+	if w.hdrlay.Flags&HDRLAY_LIBPCAP > 0 {
+		sec, ns := packetReadTime/1000000000, packetReadTime%1000000000
+		binary.LittleEndian.PutUint32(buf[0:4], uint32(sec))
+		binary.LittleEndian.PutUint32(buf[4:8], uint32(ns))
+		binary.LittleEndian.PutUint32(buf[8:12], uint32(packetLen))
+		binary.LittleEndian.PutUint32(buf[12:16], uint32(packetLen))
+	} else {
+		binary.LittleEndian.PutUint16(buf[0:2], uint16(packetLen))
+		if w.hdrlay.Flags&HDRLAY_HAVE_STREAM_INDEX > 0 {
+			offset := w.hdrlay.StreamIndexOffset
+			binary.LittleEndian.PutUint16(buf[offset:2+offset], packetStreamIndex)
+		}
 	}
-	copy(buf[w.hdrlay.Size:], packet)
+	copy(buf[w.hdrlay.Size:], headers)
+	copy(buf[w.hdrlay.Size+len(headers):], packet)
 
 	// append block stats
 	w.currentBlockHash.Write(buf)

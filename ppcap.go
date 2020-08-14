@@ -17,7 +17,7 @@ const (
 	PPCAP_DATA_EXTENSION             = ".ppcapd"
 	PPCAP_INDEX_EXTENSION            = ".ppcapi"
 	PPCAP_MAGIC                      = 0x594c4f50 // 'POLY' (looks like text)
-	PPCAP_VERSION                    = 2
+	PPCAP_VERSION                    = 3
 	PPCAP_DEFAULT_MAX_BLOCK_MESSAGES = 256
 	PPCAP_DEFAULT_MAX_BLOCK_SIZE     = 4096
 	PPCAP_DEFAULT_FLUSH_INTERVAL_SEC = 60
@@ -28,7 +28,12 @@ const (
 	bufferSize                       = 1024 * 1024 // ideal write size
 
 	// index file flags go below
-	HDRLAY_HAVE_STREAM_INDEX = 1
+
+	// added in version 2.
+	HDRLAY_HAVE_STREAM_INDEX = 1 // 2 byte stream index follows the packet size.
+
+	// added in version 3.
+	HDRLAY_LIBPCAP = 2 // data file is original libpcap format (not pcap-NG). mutually exclusive with all other flags.
 )
 
 ///////// INTERNAL UTILITY FUNCTIONS
@@ -60,19 +65,34 @@ func littleEndian_Uint48(b []byte) uint64 {
 ///////// BASIC DATSTRUCTURES
 
 type PacketHeaderLayout struct {
-	Flags             uint32 // from IndexFileHeader
-	Size              int    // from IndexFileHeader
-	StreamIndexOffset int    // computed from flags
+	Flags               uint32
+	Size                int
+	ProtocolHeadersSize int
+	DataHeaderSize      int
+	StreamIndexOffset   int
 }
 
-func BuildPacketHeaderLayout(hdrlay *PacketHeaderLayout, Flags uint32) {
-	hdrlay.Flags = Flags
-	size := 2 // length
-	if hdrlay.Flags&HDRLAY_HAVE_STREAM_INDEX > 0 {
-		hdrlay.StreamIndexOffset = size
+func BuildPacketHeaderLayout(hdrlay *PacketHeaderLayout, flags uint32) {
+	size := 2
+	streamIndexOffset := 0
+	protocolHeadersSize := 0
+	dataHeaderSize := 0
+	if flags&HDRLAY_LIBPCAP > 0 {
+		// NOTE: currently hardcoded for LINKTYPE_IPV4 + UDP
+		size = 16
+		protocolHeadersSize = 28
+		dataHeaderSize = 24
+	} else if flags&HDRLAY_HAVE_STREAM_INDEX > 0 {
+		streamIndexOffset = size
 		size += 2
 	}
-	hdrlay.Size = size
+	*hdrlay = PacketHeaderLayout{
+		Flags:               flags,
+		Size:                size,
+		ProtocolHeadersSize: protocolHeadersSize,
+		DataHeaderSize:      dataHeaderSize,
+		StreamIndexOffset:   streamIndexOffset,
+	}
 }
 
 type IndexFileHeader struct {
@@ -83,8 +103,13 @@ type IndexFileHeader struct {
 
 	// added in version 2 to allow storing auxiliary per-packet data, e.g.
 	// stream index if multiple streams are written in a single file.
-	Flags            uint32
-	PacketHeaderSize byte
+	Flags            uint32 // 20:24
+	reserved1        byte   // [24]
+	PacketHeaderSize byte   // [25]
+
+	// added in version 3 for libpcap support
+	ProtocolHeadersSize uint16 // 26:28
+	DataHeaderSize      uint32 // 28:32
 
 	// reserved space
 	HumanReadableDescription string // 128:255
@@ -94,15 +119,24 @@ func (hdr *IndexFileHeader) Parse(buf []byte) bool {
 	if len(buf) < sizeofIndexFileHeader {
 		return false
 	}
+
+	// Version 1
 	hdr.Magic = binary.LittleEndian.Uint32(buf[0:4])
 	hdr.Version = binary.LittleEndian.Uint32(buf[4:8])
 	hdr.CreationTimeUnix64 = int64(binary.LittleEndian.Uint64(buf[8:16]))
 	hdr.TimesOpenedForAppend = binary.LittleEndian.Uint32(buf[16:20])
-	hdr.Flags = binary.LittleEndian.Uint32(buf[20:24]) // added in version 2
-	hdr.PacketHeaderSize = buf[25]                     // added in version 2
+
+	// Version 2
+	hdr.Flags = binary.LittleEndian.Uint32(buf[20:24])
+	hdr.reserved1 = buf[24]
+	hdr.PacketHeaderSize = buf[25]
 	if hdr.Version < 2 || hdr.PacketHeaderSize == 0 {
 		hdr.PacketHeaderSize = 2
 	}
+
+	// Version 3
+	hdr.ProtocolHeadersSize = binary.LittleEndian.Uint16(buf[26:28])
+	hdr.DataHeaderSize = binary.LittleEndian.Uint32(buf[28:32])
 
 	hdr.HumanReadableDescription = strings.TrimRight(string(buf[128:255]), "\x00")
 
@@ -147,13 +181,29 @@ func (b *BlockInfo) Parse(buf []byte) bool {
 	return true
 }
 
+func ReadPacketSize(wholePacket []byte, hdrlay *PacketHeaderLayout) (size int) {
+	if hdrlay.Flags&HDRLAY_LIBPCAP > 0 {
+		size = int(binary.LittleEndian.Uint32(wholePacket[8:12]))
+	} else {
+		size = int(binary.LittleEndian.Uint16(wholePacket[0:2]))
+	}
+	return
+}
+
+func ReadStreamIndex(wholePacket []byte, hdrlay *PacketHeaderLayout) (size uint16) {
+	if hdrlay.Flags&HDRLAY_HAVE_STREAM_INDEX > 0 {
+		size = binary.LittleEndian.Uint16(wholePacket[hdrlay.StreamIndexOffset:])
+	}
+	return
+}
+
 // no error checking because this block is known-good (i.e. already passed hashing)
-func CountMessagesInKnownGoodBlock(block []byte, packetHeaderSize int) int {
+func CountMessagesInKnownGoodBlock(block []byte, hdrlay *PacketHeaderLayout) int {
 	count := 0
 	for {
 		count += 1
-		psize := int(binary.LittleEndian.Uint16(block[0:2]))
-		block = block[packetHeaderSize+psize:]
+		psize := ReadPacketSize(block, hdrlay)
+		block = block[hdrlay.Size+psize:]
 		if len(block) <= 0 {
 			break
 		}
@@ -175,15 +225,45 @@ func ReadIndexFileHeader(indexFd *os.File, header *IndexFileHeader) error {
 	return nil
 }
 
+func WriteDataFileHeader(dataFd *os.File, header *IndexFileHeader) error {
+	if header.Flags&HDRLAY_LIBPCAP > 0 {
+		buf := make([]byte, 24)
+		/*
+			guint32 magic_number;   // magic number
+			guint16 version_major;  // major version number
+			guint16 version_minor;  // minor version number
+			gint32  thiszone;       // GMT to local correction
+			guint32 sigfigs;        // accuracy of timestamps
+			guint32 snaplen;        // max length of captured packets, in octets
+			guint32 network;        // data link type
+		*/
+		binary.LittleEndian.PutUint32(buf[0:4], 0xa1b23c4d) // libpcap magic, nanosecond timestamps
+		binary.LittleEndian.PutUint16(buf[4:6], 2)
+		binary.LittleEndian.PutUint16(buf[6:8], 4)
+		binary.LittleEndian.PutUint32(buf[20:24], 228) // LINKTYPE_IPV4
+		if _, err := dataFd.WriteAt(buf, 0); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func WriteIndexFileHeader(indexFd *os.File, header *IndexFileHeader) error {
 	buf := make([]byte, 256)
 
+	// Version 1
 	binary.LittleEndian.PutUint32(buf[0:4], header.Magic)
 	binary.LittleEndian.PutUint32(buf[4:8], header.Version)
 	binary.LittleEndian.PutUint64(buf[8:16], uint64(header.CreationTimeUnix64))
 	binary.LittleEndian.PutUint32(buf[16:20], header.TimesOpenedForAppend)
+
+	// Version 2
 	binary.LittleEndian.PutUint32(buf[20:24], header.Flags)
 	buf[25] = header.PacketHeaderSize
+
+	// Version 3
+	binary.LittleEndian.PutUint16(buf[26:28], header.ProtocolHeadersSize)
+	binary.LittleEndian.PutUint32(buf[28:32], header.DataHeaderSize)
 
 	copy(buf[128:255], []byte(header.HumanReadableDescription))
 
@@ -294,20 +374,25 @@ func ReopenAndTruncateExistingCapture(
 
 	numBlocks := int64(0)
 
-	lastGoodIndexPosition := int64(sizeofIndexFileHeader)
-	lastGoodDataPosition := int64(0)
-
 	if indexFileSize < sizeofIndexFileHeader {
 		// no header
 	} else {
 		if err := ReadIndexFileHeader(indexFd, outHeader); err != nil {
 			return err
 		}
+		if int(outHeader.PacketHeaderSize) != hdrlay.Size ||
+			int(outHeader.DataHeaderSize) != hdrlay.DataHeaderSize ||
+			int(outHeader.ProtocolHeadersSize) != hdrlay.ProtocolHeadersSize {
+			return errors.New("capture file does not match header layout")
+		}
 		*outbValidExistingFile = true
 
 		blockArrayByteLength := indexFileSize - sizeofIndexFileHeader
 		numBlocks = blockArrayByteLength / sizeofIndexEntry
 	}
+
+	lastGoodIndexPosition := int64(sizeofIndexFileHeader)
+	lastGoodDataPosition := int64(outHeader.DataHeaderSize)
 
 	// iterate backwards from the last readable block header,
 	// looking for a valid block
@@ -326,7 +411,7 @@ func ReopenAndTruncateExistingCapture(
 			dataBuf = make([]byte, 2*blockHdr.ByteCount)
 		}
 		blockEnd := blockHdr.Position + int64(blockHdr.ByteCount)
-		if blockEnd < dataFileSize {
+		if blockEnd <= dataFileSize {
 			blockBuf := dataBuf[:blockHdr.ByteCount]
 			if _, err := dataFd.ReadAt(blockBuf, blockHdr.Position); err != nil {
 				return err
@@ -334,7 +419,7 @@ func ReopenAndTruncateExistingCapture(
 			hasher.Reset()
 			hasher.Write(blockBuf)
 			if hasher.Sum64() == blockHdr.Hash {
-				messageCount := CountMessagesInKnownGoodBlock(blockBuf, hdrlay.Size)
+				messageCount := CountMessagesInKnownGoodBlock(blockBuf, hdrlay)
 				*outMessageSequence = blockHdr.SeqNum + int64(messageCount)
 				// matched successfully
 				lastGoodIndexPosition = indexEntryOffset + sizeofIndexEntry

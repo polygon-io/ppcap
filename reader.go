@@ -1,7 +1,6 @@
 package ppcap
 
 import (
-	"encoding/binary"
 	"io"
 	"os"
 	"reflect"
@@ -27,37 +26,30 @@ type DataReadStream struct {
 }
 
 type NextPacketOutput struct {
-	PayloadSize     uint16 // filled if possible
-	StreamIndex     uint16 // filled if possible
-	WholePacketSize uint32 // filled if possible
-	Header          []byte // filled only on success
-	Payload         []byte // filled only on success
-	WholePacket     []byte // filled only on success
+	wholePacketSize int
+	WholePacket     []byte // entire frame
+	Headers         []byte // ppcap headers + protocol headers
+	Payload         []byte // application layer
 }
 
 // generic next packet on byte slice
+// output is only modified on success
 func NextPacket(stream *[]byte, hdrlay *PacketHeaderLayout, output *NextPacketOutput) bool {
 	read := *stream
 	*output = NextPacketOutput{}
 	if len(read) < hdrlay.Size {
 		return false
 	}
-	output.PayloadSize = binary.LittleEndian.Uint16(read[0:2])
-	wholePacketSize := hdrlay.Size + int(output.PayloadSize)
-	output.WholePacketSize = uint32(wholePacketSize)
+	wholePacketSize := hdrlay.Size + ReadPacketSize(read, hdrlay)
+	output.wholePacketSize = wholePacketSize
 	if len(read) < wholePacketSize {
 		return false
-	}
-	output.StreamIndex = 0
-	if hdrlay.Flags&HDRLAY_HAVE_STREAM_INDEX > 0 {
-		offset := hdrlay.StreamIndexOffset
-		output.StreamIndex = binary.LittleEndian.Uint16(read[offset : offset+2])
 	}
 	// advance stream
 	*stream = read[wholePacketSize:]
 	output.WholePacket = read[:wholePacketSize]
-	output.Header = read[:hdrlay.Size]
-	output.Payload = read[hdrlay.Size:wholePacketSize]
+	output.Headers = read[:hdrlay.Size+hdrlay.ProtocolHeadersSize]
+	output.Payload = read[hdrlay.Size+hdrlay.ProtocolHeadersSize : wholePacketSize]
 	return true
 }
 
@@ -142,7 +134,7 @@ func (rs *DataReadStream) ReadNextPacket(output *NextPacketOutput) error {
 
 		rdbuf := rs.buf[rs.bufferUsed : rs.bufferUsed+rs.bufferAvail]
 		success := NextPacket(&rdbuf, &rs.hdrlay, output)
-		wholePacketSize := int(output.WholePacketSize)
+		wholePacketSize := output.wholePacketSize
 		if success {
 			rs.bufferAvail -= wholePacketSize
 			rs.bufferUsed += wholePacketSize
@@ -330,10 +322,11 @@ func EvaluateCapture(where *CapturePath, result *EvaluateCaptureResult) error {
 				}
 				break
 			}
-			if streamHashes[packet.StreamIndex] == nil {
-				streamHashes[packet.StreamIndex] = xxhash.New64()
+			streamIndex := ReadStreamIndex(packet.WholePacket, &memidx.Layout)
+			if streamHashes[streamIndex] == nil {
+				streamHashes[streamIndex] = xxhash.New64()
 			}
-			streamHashes[packet.StreamIndex].Write(packet.Payload)
+			streamHashes[streamIndex].Write(packet.Payload)
 			blockHash.Write(packet.WholePacket)
 			result.PacketCount += 1
 			result.TotalPayloadSize += int64(len(packet.Payload))
