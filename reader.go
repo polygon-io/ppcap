@@ -1,6 +1,7 @@
 package ppcap
 
 import (
+	"encoding/binary"
 	"io"
 	"os"
 	"reflect"
@@ -53,11 +54,23 @@ func NextPacket(stream *[]byte, hdrlay *PacketHeaderLayout, output *NextPacketOu
 	return true
 }
 
+// without this hack, user code would need to be modified 10+ locations.
+// probability of false positive is 2^-40 (about one in a trillion).
+func XXX_HACK_autodetect_libpcap_layout(reader io.ReaderAt, hdrlay *PacketHeaderLayout) {
+	buf := make([]byte, 24)
+	reader.ReadAt(buf, 0)
+	if 0xa1b23c4d == binary.LittleEndian.Uint32(buf[0:4]) &&
+		228 == binary.LittleEndian.Uint32(buf[20:24]) {
+		BuildPacketHeaderLayout(hdrlay, HDRLAY_LIBPCAP)
+	}
+}
+
 func NewDataReadStream(reader io.ReaderAt, hdrlay *PacketHeaderLayout) *DataReadStream {
 	rs := &DataReadStream{}
 	rs.hdrlay = *hdrlay
 	rs.reader = reader
 	rs.buf = make([]byte, 2*PPCAP_DEFAULT_MAX_BLOCK_SIZE)
+	XXX_HACK_autodetect_libpcap_layout(reader, &rs.hdrlay)
 	rs.reset()
 	return rs
 }
@@ -100,7 +113,7 @@ func (rs *DataReadStream) refillBuffer(packetLen int) error {
 func (rs *DataReadStream) reset() {
 	rs.iseof = false
 	rs.isunderlyingeof = false
-	rs.bufferOffset = 0
+	rs.bufferOffset = int64(rs.hdrlay.DataHeaderSize)
 	rs.bufferAvail = 0
 	rs.bufferUsed = len(rs.buf)
 	rs.endOffset = 0
